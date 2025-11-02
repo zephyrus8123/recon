@@ -8,14 +8,11 @@ Features:
 - Menu: [1] Single Target, [2] Multi Target (file list)
 - Auto-install missing tools (go install) & pip deps automatically
 - Pipeline: subfinder -> httpx -> waybackurls -> katana -> combine -> filter -> nuclei
-- Real-time Discord messages (per-step) and partial nuclei findings while nuclei runs
+- Real-time Discord messages (per-step) with embed
+- HTTPX alive hosts: scheme stripped (upr.ac.id instead of https://upr.ac.id)
 - On nuclei finish: upload full nuclei output file (.txt) to Discord
 - Default nuclei severity: critical,high,medium (configurable via CLI)
 - You MUST confirm permission by typing 'yes' before scan begins
-
-Usage:
-  1) Edit DISCORD_WEBHOOK_URL below with your webhook.
-  2) python3 recon_discord.py
 """
 
 import os
@@ -33,7 +30,7 @@ import requests
 from collections import Counter
 
 # ----- CONFIG: EDIT THIS -----
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1388192484265427025/jnEKDqZ8u-4AFPmdfA7YTSXZSfP87I4ZUWZGrcCWkQn8LBgD3fKCec9BSJPrVKABDNy4"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1434645581413879868/AXG3p-2f4t1fb-WqZ3ZAN9K2ctJllobCIHasSQyBPd5_G8fPkgyc8nV5C0vIp-cDJkP6"
 # -----------------------------
 
 # Tools mapping (go install pkg)
@@ -124,18 +121,23 @@ def ensure_tools_auto():
             failed[t] = f"go install failed for {pkg}"
     return installed, failed
 
-# ----- Discord helpers -----
-def send_discord_message(content, username="ZephyrusRecon"):
+# ----- Discord helpers with embed support -----
+def send_discord_embed(title, description=None, color=0x00ff00, fields=None, username="ZephyrusRecon"):
     if not DISCORD_WEBHOOK_URL or "PUT_YOUR" in DISCORD_WEBHOOK_URL:
-        print("[!] Discord webhook not configured. Skipping send.")
+        print("[!] Discord webhook not configured. Skipping embed send.")
         return False, "no webhook"
-    payload = {"content": content, "username": username}
+    payload = {
+        "username": username,
+        "embeds": [{
+            "title": title,
+            "description": description or "",
+            "color": color,
+            "fields": fields or []
+        }]
+    }
     try:
         r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-        if r.status_code in (200, 204):
-            return True, r.text
-        else:
-            return False, f"{r.status_code} {r.text}"
+        return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
 
@@ -180,6 +182,7 @@ def filter_urls_set(urls):
 def strip_scheme(urls):
     clean=[]
     for u in urls:
+        u=u.strip()
         if u.startswith("http://"):
             clean.append(u[len("http://"):])
         elif u.startswith("https://"):
@@ -210,9 +213,9 @@ def run_httpx_on_list(list_lines):
         for ln in stdout.splitlines():
             ln = ln.strip()
             if not ln: continue
-            # Ambil URL langsung
             alive.append(ln)
-        return 0, "\n".join(alive), stderr
+        alive_stripped = strip_scheme(alive)
+        return 0, "\n".join(alive_stripped), stderr
     except Exception as e:
         return 1, "", str(e)
 
@@ -262,7 +265,6 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", batc
             if periodic_upload and (time.time()-last_upload)>=900:
                 send_discord_file(out_file, content="Partial nuclei output")
                 last_upload=time.time()
-        # flush remaining
         if buffer_lines:
             send_partial_findings(buffer_lines)
         if periodic_upload:
@@ -272,32 +274,31 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", batc
 def send_partial_findings(lines):
     if not lines: return
     summary=f"⚠️ Partial Nuclei Findings ({len(lines)} new)\nExamples:\n"+"\n".join(lines[:5])
-    send_discord_message(summary)
+    send_discord_embed("Partial Nuclei Findings", description=summary, color=0xf39c12)
 
-# ----- nuclei summary -----
+# ----- nuclei summary embed -----
 def send_nuclei_summary(out_file, workdir, target):
     lines = read_lines(out_file)
     total_targets = len(lines)
     severity_counts = Counter()
     for l in lines:
-        # contoh: "TemplateID [C]" → ambil severity terakhir dalam []
         if "[" in l and "]" in l:
             sev = l.split("[")[-1].split("]")[0]
             severity_counts[sev] += 1
-    summary = (
-        f"🏁 SCAN COMPLETED\n"
-        f"Workdir: {workdir}\n"
-        f"Target: {target}\n"
-        f"Targets scanned: {total_targets}\n"
-        f"Nuclei findings: {len(lines)}\n"
-        f"Severity\n"
-        f"🔴C:{severity_counts.get('critical',0)} "
-        f"🟠H:{severity_counts.get('high',0)} "
-        f"🟡M:{severity_counts.get('medium',0)} "
-        f"🔵L:{severity_counts.get('low',0)} "
-        f"ℹ️I:{severity_counts.get('info',0)}"
+
+    fields = [
+        {"name":"Critical 🔴", "value": str(severity_counts.get("critical",0)), "inline":True},
+        {"name":"High 🟠", "value": str(severity_counts.get("high",0)), "inline":True},
+        {"name":"Medium 🟡", "value": str(severity_counts.get("medium",0)), "inline":True},
+        {"name":"Low 🔵", "value": str(severity_counts.get("low",0)), "inline":True},
+        {"name":"Info ℹ️", "value": str(severity_counts.get("info",0)), "inline":True},
+    ]
+    send_discord_embed(
+        title="🏁 SCAN COMPLETED",
+        description=f"Workdir: {workdir}\nTarget: {target}\nTargets scanned: {total_targets}\nNuclei findings: {len(lines)}",
+        fields=fields,
+        color=0xe74c3c
     )
-    send_discord_message(summary)
 
 # ----- pipeline -----
 def pipeline_for_domain(domain, workdir:Path, args):
@@ -309,68 +310,92 @@ def pipeline_for_domain(domain, workdir:Path, args):
     out_nuc=workdir/f"nuclei_output_{ts}.txt"
     tmp_alive_file=workdir/f"alive_httpx_{ts}.txt"
 
-    send_discord_message(f"🚀 RECON SCAN STARTED\nTarget: {domain}\nSteps: subfinder → httpx → wayback → katana → filter → nuclei")
+    send_discord_embed(
+        title=f"🚀 RECON SCAN STARTED for {domain}",
+        description="Steps: subfinder → httpx → wayback → katana → filter → nuclei",
+        color=0x3498db
+    )
 
     # subfinder
-    send_discord_message(f"⚪ Running subfinder for {domain} ...")
+    send_discord_embed(title="⚪ Subfinder", description=f"Running subfinder for {domain} ...", color=0x95a5a6)
     run_subfinder(domain, str(out_sub))
     subs=read_lines(str(out_sub))
-    send_discord_message(f"✅ subfinder: found {len(subs)} subdomains")
+    send_discord_embed(
+        title="⚪ Subfinder Results",
+        description=f"Found {len(subs)} subdomains",
+        fields=[{"name":"Sample", "value": "\n".join(subs[:5]) if subs else "None", "inline": False}],
+        color=0x2ecc71
+    )
     if subs:
         send_discord_file(str(out_sub), content=f"Subfinder Results ({len(subs)} items)")
 
     # httpx
-    send_discord_message("🌐 Checking which subdomains are alive with httpx ...")
+    send_discord_embed(title="🌐 HTTPX", description="Checking alive hosts...", color=0x95a5a6)
     alive=[]
     if subs:
         rc, stdout, stderr = run_httpx_on_list(subs)
         alive = stdout.splitlines()
-    send_discord_message(f"✅ httpx: {len(alive)} alive hosts")
-    if alive:
-        with open(tmp_alive_file,"w") as f: f.write("\n".join(alive))
-        send_discord_file(str(tmp_alive_file), content=f"HTTPX Alive Hosts ({len(alive)} items)")
+    alive_stripped = strip_scheme(alive)
+    send_discord_embed(
+        title="🌐 HTTPX Alive Hosts",
+        description=f"{len(alive_stripped)} alive hosts found",
+        fields=[{"name":"Sample", "value": "\n".join(alive_stripped[:5]) if alive_stripped else "None", "inline": False}],
+        color=0x1abc9c
+    )
+    if alive_stripped:
+        with open(tmp_alive_file,"w") as f: f.write("\n".join(alive_stripped))
+        send_discord_file(str(tmp_alive_file), content=f"HTTPX Alive Hosts ({len(alive_stripped)} items)")
 
     # wayback
-    send_discord_message("📚 Collecting Wayback URLs ...")
+    send_discord_embed(title="📚 Wayback", description="Collecting Wayback URLs ...", color=0x95a5a6)
     run_wayback(domain, str(out_way))
     wayback=read_lines(str(out_way))
-    send_discord_message(f"✅ waybackurls: {len(wayback)} URLs collected")
+    send_discord_embed(
+        title="📚 Wayback URLs",
+        description=f"{len(wayback)} URLs collected",
+        fields=[{"name":"Sample", "value": "\n".join(wayback[:5]) if wayback else "None", "inline": False}],
+        color=0xf1c40f
+    )
 
     # katana
     combined=set(wayback)
-    send_discord_message("🕷️ Katana crawling ...")
+    send_discord_embed(title="🕷️ Katana", description="Crawling with katana ...", color=0x95a5a6)
     kat=[]
-    if alive:
+    if alive_stripped:
         tmp_hosts=workdir/f"kat_hosts_{ts}.txt"
-        with open(tmp_hosts,"w") as f: f.write("\n".join(alive))
+        with open(tmp_hosts,"w") as f: f.write("\n".join(alive_stripped))
         run_katana(str(tmp_hosts),str(out_kat))
         kat=read_lines(str(out_kat))
         combined.update(kat)
-        send_discord_message(f"✅ katana: collected {len(kat)} URLs")
+    send_discord_embed(
+        title="🕷️ Katana Results",
+        description=f"{len(kat)} URLs collected",
+        fields=[{"name":"Sample", "value": "\n".join(kat[:5]) if kat else "None", "inline": False}],
+        color=0xe67e22
+    )
 
-    # Tentukan input nuclei sesuai kondisi
+    # nuclei input
     if combined:
         if kat:
             nuclei_source = kat
         else:
             nuclei_source = wayback
     else:
-        nuclei_source = strip_scheme(alive)
-
+        nuclei_source = alive_stripped
     if not nuclei_source:
-        send_discord_message(f"⚠️ No URLs to scan for {domain}.")
+        send_discord_embed(title="⚠️ No URLs", description=f"No URLs to scan for {domain}.", color=0xe74c3c)
         return {"status":"no-targets"}
 
     tmp_list=workdir/f"nuclei_list_{ts}.txt"
     with open(tmp_list,"w") as f:
         for u in nuclei_source: f.write(u+"\n")
 
-    send_discord_message(f"💥 Starting nuclei (severity={args.nuclei_severity})")
+    send_discord_embed(title="💥 Nuclei Scan", description=f"Starting nuclei (severity={args.nuclei_severity})", color=0xf39c12)
     run_nuclei_stream(str(tmp_list), str(out_nuc), severity=args.nuclei_severity, batch_size=5, batch_timeout=900, periodic_upload=True)
     send_discord_file(str(out_nuc), content=f"Nuclei results for {domain}")
     send_nuclei_summary(str(out_nuc), workdir, domain)
 
-    send_discord_message(f"🏁 Scan completed for {domain}")
+    send_discord_embed(title="🏁 Scan Completed", description=f"Scan finished for {domain}", color=0x2ecc71)
     return {"status":"done"}
 
 # ----- main -----
@@ -383,9 +408,9 @@ def main():
 
     os.environ["PATH"] += os.pathsep + os.path.expanduser("~/go/bin")
 
-    send_discord_message("🛠️ Checking & installing required tools ...")
+    send_discord_embed(title="🛠️ Recon Init", description="Checking & installing required tools ...", color=0x95a5a6)
     installed,failed=ensure_tools_auto()
-    send_discord_message(f"🛠️ Installed: {installed} | Failed: {list(failed.keys())}")
+    send_discord_embed(title="🛠️ Tools Status", description=f"Installed: {installed}\nFailed: {list(failed.keys())}", color=0x3498db)
 
     print("Choose mode:\n[1] Single Target\n[2] Multi Target (file)")
     choice=input("Select 1 or 2: ").strip()
@@ -393,7 +418,7 @@ def main():
 
     if choice=="1":
         domain=input("Enter target domain (example.com): ").strip()
-        send_discord_message(f"🛰️ Single-target scan initiated for {domain}")
+        send_discord_embed(title="🛰️ Single-target Scan", description=f"Scan initiated for {domain}", color=0x3498db)
         class Arg: pass
         Arg.mode="single"
         Arg.use_katana_single=True
@@ -404,7 +429,7 @@ def main():
         list_path=input("Enter path to domains file: ").strip()
         domains=read_lines(list_path)
         if not domains: return
-        send_discord_message(f"🛰️ Multi-target recon started ({len(domains)} domains)")
+        send_discord_embed(title="🛰️ Multi-target Scan", description=f"Recon started ({len(domains)} domains)", color=0x3498db)
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             futures={}
             for d in domains:
@@ -416,11 +441,11 @@ def main():
                 d=futures[fut]
                 try:
                     res=fut.result()
-                    send_discord_message(f"✅ Finished scan for {d}: {res.get('status')}")
+                    send_discord_embed(title=f"✅ Finished scan for {d}", description=f"Status: {res.get('status')}", color=0x2ecc71)
                 except Exception as e:
-                    send_discord_message(f"⚠️ Error scanning {d}: {e}")
+                    send_discord_embed(title=f"⚠️ Error scanning {d}", description=str(e), color=0xe74c3c)
 
-    send_discord_message("🏁 All tasks finished. Check uploaded files.")
+    send_discord_embed(title="🏁 All Tasks Finished", description="Check uploaded files in Discord.", color=0x2ecc71)
 
 if __name__=="__main__":
     main()
