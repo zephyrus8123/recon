@@ -30,6 +30,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
+import tempfile
 
 # ----- CONFIG: EDIT THIS -----
 DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1388192484265427025/jnEKDqZ8u-4AFPmdfA7YTSXZSfP87I4ZUWZGrcCWkQn8LBgD3fKCec9BSJPrVKABDNy4"
@@ -47,10 +48,8 @@ PY_DEPS = ["requests", "beautifulsoup4"]
 
 # ----- helpers -----
 def which(cmd):
-    # cek PATH biasa
     if shutil.which(cmd):
         return True
-    # tambahan cek default Go bin di Termux
     termux_go_bin = os.path.expanduser("~/go/bin")
     return os.path.exists(os.path.join(termux_go_bin, cmd))
 
@@ -158,16 +157,14 @@ def send_discord_file(file_path, content=None, filename=None):
     if not DISCORD_WEBHOOK_URL or "PUT_YOUR" in DISCORD_WEBHOOK_URL:
         print("[!] Discord webhook not configured. Skipping file upload.")
         return False, "no webhook"
-    files = {}
     if filename is None:
         filename = os.path.basename(file_path)
     try:
         with open(file_path, "rb") as f:
-            form = {"file": (filename, f)}
             data = {}
             if content:
                 data["payload_json"] = json.dumps({"content": content})
-            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data={}, timeout=60)
+            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data=data, timeout=60)
         return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
@@ -200,23 +197,55 @@ def run_subfinder(domain, out_path):
     return run(cmd, timeout=600)
 
 def run_httpx_on_list(list_lines):
-    cmd = ["httpx", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-probe", "-timeout", "10", "-retries", "2"]
-    alive=[]
+    """
+    Termux-friendly: httpx -l <file> -o <alive_file>
+    """
+    alive_out = ""
     try:
-        fixed = []
-        for u in list_lines:
-            u = u.strip()
-            if not u: continue
-            if u.startswith("http://") or u.startswith("https://"):
-                fixed.append(u)
-            else:
-                fixed.append("https://" + u)
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = proc.communicate(input="\n".join(fixed)+"\n", timeout=900)
-        for ln in stdout.splitlines():
-            if ln.strip():
-                alive.append(ln.strip())
-        return 0, "\n".join(alive), stderr
+        # tulis subfinder/combined list ke temp file
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8") as tf:
+            tmp_in = tf.name
+            for u in list_lines:
+                u = u.strip()
+                if not u:
+                    continue
+                tf.write(u + "\n")
+
+        # output file
+        tmp_out = os.path.join(tempfile.gettempdir(), "alive_httpx.txt")
+
+        # jalankan httpx
+        cmd = [
+            "httpx",
+            "-l", tmp_in,
+            "-o", tmp_out,
+            "-silent",
+            "-no-color",
+            "-follow-redirects",
+            "-probe",
+            "-timeout", "10",
+            "-retries", "2"
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(timeout=900)
+
+        # baca hasil
+        try:
+            with open(tmp_out, "r", encoding="utf-8") as f:
+                alive_out = f.read().strip()
+        except FileNotFoundError:
+            alive_out = ""
+
+        # cleanup
+        try: os.remove(tmp_in)
+        except: pass
+        try: os.remove(tmp_out)
+        except: pass
+
+        return proc.returncode, alive_out, stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
     except Exception as e:
         return 1, "", str(e)
 
@@ -410,7 +439,6 @@ def main():
     parser.add_argument("--nuclei-severity",default="critical,high,medium")
     args=parser.parse_args()
 
-    # --- Termux PATH fix
     os.environ["PATH"] += os.pathsep + os.path.expanduser("~/go/bin")
 
     send_discord_message("🛠️ Checking & installing required tools ...")
