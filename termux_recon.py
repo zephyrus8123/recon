@@ -158,7 +158,8 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", peri
             fout.write(line+"\n"); fout.flush()
             buffer_lines.append(line)
             if periodic_upload and (time.time()-last_upload)>=600 and buffer_lines:
-                send_discord_file(out_file,f"Partial nuclei output ({len(buffer_lines)} new)"); last_upload=time.time(); buffer_lines=[]
+                send_discord_file(out_file,f"Partial nuclei output ({len(buffer_lines)} new)")
+                last_upload=time.time(); buffer_lines=[]
     if periodic_upload: send_discord_file(out_file,"Final nuclei output")
     return {"stdout":"nuclei finished"}
 
@@ -248,13 +249,13 @@ def main():
     choice=input("Choose mode:\n[1] Single Target\n[2] Multi Target (file)\nSelect 1 or 2: ").strip()
     if choice=="1":
         domain=input("Enter target domain: ").strip()
-        class Arg: pass; Arg.nuclei_severity=args.nuclei_severity
+        Arg=type("Arg",(object,),{})(); Arg.nuclei_severity=args.nuclei_severity
         workdir=Path(args.workdir)/domain.replace(".","_")
         pipeline_for_domain(domain,workdir,Arg)
     elif choice=="2":
         list_path=input("Enter path to domains file: ").strip(); domains=read_lines(list_path)
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-            futures={ex.submit(pipeline_for_domain,d,Path(args.workdir)/d.replace(".","_"),args):d for d in domains}
+            futures={ex.submit(pipeline_for_domain,d,Path(args.workdir)/d.replace(".","_"),type("Arg",(object,),{"nuclei_severity":args.nuclei_severity})()):d for d in domains}
             for fut in as_completed(futures):
                 d=futures[fut]
                 try: res=fut.result(); send_discord_embed("✅ Scan finished",f"{d} status: {res.get('status')}")
