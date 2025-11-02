@@ -156,16 +156,14 @@ def send_discord_file(file_path, content=None, filename=None):
     if not DISCORD_WEBHOOK_URL or "PUT_YOUR" in DISCORD_WEBHOOK_URL:
         print("[!] Discord webhook not configured. Skipping file upload.")
         return False, "no webhook"
-    files = {}
     if filename is None:
         filename = os.path.basename(file_path)
     try:
         with open(file_path, "rb") as f:
-            form = {"file": (filename, f)}
             data = {}
             if content:
                 data["payload_json"] = json.dumps({"content": content})
-            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data={}, timeout=60)
+            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data=data, timeout=60)
         return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
@@ -198,26 +196,27 @@ def run_subfinder(domain, out_path):
     return run(cmd, timeout=600)
 
 def run_httpx_on_list(list_lines):
-    cmd = ["httpx", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-probe", "-timeout", "10", "-retries", "2"]
     alive=[]
+    if not list_lines:
+        return 1, "", "empty list"
+    fixed=[]
+    for u in list_lines:
+        u = u.strip()
+        if not u: continue
+        if u.startswith("http://") or u.startswith("https://"):
+            fixed.append(u)
+        else:
+            fixed.append("https://" + u)
+    if not fixed:
+        return 1, "", "no valid URLs"
+    cmd = ["httpx", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-timeout", "10", "-retries", "2"]
     try:
-        fixed = []
-        for u in list_lines:
-            u = u.strip()
-            if not u: continue
-            if u.startswith("http://") or u.startswith("https://"):
-                fixed.append(u)
-            else:
-                fixed.append("https://" + u)
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout, stderr = proc.communicate(input="\n".join(fixed)+"\n", timeout=900)
         for ln in stdout.splitlines():
-            ln=ln.strip()
-            if not ln:
-                continue
-            if "[SUCCESS]" in ln:
-                url=ln.split()[0]  # ambil URL saja, buang [SUCCESS]
-                alive.append(url)
+            ln = ln.strip()
+            if ln:
+                alive.append(ln)
         return 0, "\n".join(alive), stderr
     except Exception as e:
         return 1, "", str(e)
@@ -305,6 +304,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     out_raw=workdir/f"urls_raw_{ts}.txt"
     out_filt=workdir/f"urls_filtered_{ts}.txt"
     out_nuc=workdir/f"nuclei_output_{ts}.txt"
+    out_httpx=workdir/f"alive_httpx_{ts}.txt"
 
     send_discord_embed("🚀 RECON SCAN STARTED", f"Target: `{domain}`\nSteps: subfinder → httpx → wayback → katana → filter → nuclei", color=0x00aaff)
 
@@ -324,11 +324,11 @@ def pipeline_for_domain(domain, workdir:Path, args):
         for ln in stdout.splitlines():
             if ln.strip():
                 alive.append(ln.strip())
+    alive=sorted(set(alive))
     send_discord_message(f"✅ httpx: **{len(alive)}** alive hosts")
     if alive:
-        tmp_alive_file=workdir/f"httpx_alive_{ts}.txt"
-        with open(tmp_alive_file,"w") as f: f.write("\n".join(alive))
-        send_discord_file(str(tmp_alive_file), content=f"📄 HTTPX Toolkit Alive Hosts ({len(alive)} items)")
+        with open(out_httpx,"w") as f: f.write("\n".join(alive))
+        send_discord_file(str(out_httpx), content=f"📄 HTTPX Toolkit Alive Hosts ({len(alive)} items)")
 
     # wayback
     send_discord_message("📚 Collecting Wayback URLs ...")
@@ -356,7 +356,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
         else:
             send_discord_message("⚠️ Katana URLs kosong.")
 
-    # fallback ke httpx jika wayback & katana kosong
+    # fallback ke httpx alive jika wayback & katana kosong
     if not combined:
         combined=set(alive)
 
@@ -383,20 +383,11 @@ def pipeline_for_domain(domain, workdir:Path, args):
     send_discord_message(f"🔘 Filtered targets for nuclei: **{len(pool)}**")
     send_discord_file(str(out_filt), content="Filtered URLs")
 
-    # tentukan sumber nuclei: katana > wayback > httpx
-    if katana_urls := read_lines(str(out_kat)):
-        nuclei_input = katana_urls
-    elif wayback_urls := read_lines(str(out_way)):
-        nuclei_input = wayback_urls
-    else:
-        nuclei_input = alive
-
     # nuclei
     send_discord_message(f"💥 Starting nuclei (severity={args.nuclei_severity})")
     tmp_list=workdir/f"nuclei_list_{ts}.txt"
     with open(tmp_list,"w") as f:
-        for u in nuclei_input:
-            f.write(u+"\n")
+        for u in pool: f.write(u+"\n")
     summary=run_nuclei_stream(str(tmp_list),str(out_nuc),severity=args.nuclei_severity,batch_size=5,batch_timeout=900, periodic_upload=True)
 
     fields=[{"name":"Target","value":domain,"inline":True},
@@ -463,7 +454,7 @@ def main():
                     res=fut.result()
                     send_discord_message(f"✅ Finished scan for {d}: {res.get('status')}")
                 except Exception as e:
-                    send_discord_message(f"⚠️ Error scanning {d}: {e}")
+                    send_discord_message(f"⚠️ Error scanning {d}: {str(e)}")
 
 if __name__=="__main__":
     main()
