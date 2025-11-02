@@ -112,13 +112,6 @@ def ensure_tools_auto():
         ok = go_install(pkg)
         if ok:
             installed.append(t)
-            rc, out, err = run(["go", "env", "GOBIN"], timeout=10)
-            gobin = out.strip() if rc == 0 else ""
-            if gobin and os.path.exists(os.path.join(gobin, t)):
-                try:
-                    run(["sudo", "cp", os.path.join(gobin, t), "/usr/local/bin/"+t], timeout=30)
-                except Exception:
-                    pass
         else:
             failed[t] = f"go install failed for {pkg}"
     return installed, failed
@@ -160,10 +153,7 @@ def send_discord_file(file_path, content=None, filename=None):
         filename = os.path.basename(file_path)
     try:
         with open(file_path, "rb") as f:
-            data = {}
-            if content:
-                data["payload_json"] = json.dumps({"content": content})
-            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data=data, timeout=60)
+            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data={}, timeout=60)
         return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
@@ -195,31 +185,9 @@ def run_subfinder(domain, out_path):
     cmd = ["subfinder", "-d", domain, "-o", out_path]
     return run(cmd, timeout=600)
 
-def run_httpx_on_list(list_lines):
-    alive=[]
-    if not list_lines:
-        return 1, "", "empty list"
-    fixed=[]
-    for u in list_lines:
-        u = u.strip()
-        if not u: continue
-        if u.startswith("http://") or u.startswith("https://"):
-            fixed.append(u)
-        else:
-            fixed.append("https://" + u)
-    if not fixed:
-        return 1, "", "no valid URLs"
-    cmd = ["httpx", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-timeout", "10", "-retries", "2"]
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = proc.communicate(input="\n".join(fixed)+"\n", timeout=900)
-        for ln in stdout.splitlines():
-            ln = ln.strip()
-            if ln:
-                alive.append(ln)
-        return 0, "\n".join(alive), stderr
-    except Exception as e:
-        return 1, "", str(e)
+def run_httpx_file(input_file, output_file):
+    cmd = ["httpx", "-l", input_file, "-o", output_file, "-silent", "-no-color", "-follow-redirects", "-timeout", "10", "-retries", "2"]
+    return run(cmd, timeout=900)
 
 def run_wayback(domain, out_path):
     cmd = ["bash", "-lc", f"echo {domain} | waybackurls 2>/dev/null | tee {out_path}"]
@@ -301,10 +269,9 @@ def pipeline_for_domain(domain, workdir:Path, args):
     out_sub=workdir/f"subfinder_{ts}.txt"
     out_way=workdir/f"wayback_{ts}.txt"
     out_kat=workdir/f"katana_{ts}.txt"
-    out_raw=workdir/f"urls_raw_{ts}.txt"
+    out_alive=workdir/f"alive_httpx_{ts}.txt"
     out_filt=workdir/f"urls_filtered_{ts}.txt"
     out_nuc=workdir/f"nuclei_output_{ts}.txt"
-    out_httpx=workdir/f"alive_httpx_{ts}.txt"
 
     send_discord_embed("🚀 RECON SCAN STARTED", f"Target: `{domain}`\nSteps: subfinder → httpx → wayback → katana → filter → nuclei", color=0x00aaff)
 
@@ -320,15 +287,15 @@ def pipeline_for_domain(domain, workdir:Path, args):
     send_discord_message("🌐 Checking which subdomains are alive with httpx ...")
     alive=[]
     if subs:
-        rc,stdout,stderr=run_httpx_on_list(subs)
-        for ln in stdout.splitlines():
-            if ln.strip():
-                alive.append(ln.strip())
-    alive=sorted(set(alive))
+        # simpan subdomain ke temp file
+        tmp_file=workdir/f"subdomains_temp_{ts}.txt"
+        with open(tmp_file,"w") as f:
+            for u in subs: f.write(u+"\n")
+        rc, out, err = run_httpx_file(str(tmp_file), str(out_alive))
+        alive = read_lines(str(out_alive))
     send_discord_message(f"✅ httpx: **{len(alive)}** alive hosts")
     if alive:
-        with open(out_httpx,"w") as f: f.write("\n".join(alive))
-        send_discord_file(str(out_httpx), content=f"📄 HTTPX Toolkit Alive Hosts ({len(alive)} items)")
+        send_discord_file(str(out_alive), content=f"📄 HTTPX Toolkit Alive Hosts ({len(alive)} items)")
 
     # wayback
     send_discord_message("📚 Collecting Wayback URLs ...")
@@ -356,20 +323,20 @@ def pipeline_for_domain(domain, workdir:Path, args):
         else:
             send_discord_message("⚠️ Katana URLs kosong.")
 
-    # fallback ke httpx alive jika wayback & katana kosong
+    # fallback ke httpx jika wayback & katana kosong
     if not combined:
         combined=set(alive)
-
     send_discord_message(f"✅ Total combined URLs: **{len(combined)}**")
 
     # filter only responsive URLs for nuclei
     send_discord_message(f"🔎 Probing URLs with httpx to filter responsive URLs ...")
     responsive=[]
     if combined:
-        rc,stdout,stderr=run_httpx_on_list(list(combined))
-        for ln in stdout.splitlines():
-            if ln.strip():
-                responsive.append(ln.strip())
+        tmp_comb_file=workdir/f"combined_tmp_{ts}.txt"
+        with open(tmp_comb_file,"w") as f:
+            for u in combined: f.write(u+"\n")
+        rc, out, err = run_httpx_file(str(tmp_comb_file), tmp_comb_file)
+        responsive = read_lines(str(tmp_comb_file))
     responsive=sorted(set(responsive))
     send_discord_message(f"✅ Responsive URLs: **{len(responsive)}**")
     if not responsive:
@@ -412,6 +379,7 @@ def main():
     parser.add_argument("--nuclei-severity",default="critical,high,medium")
     args=parser.parse_args()
 
+    # --- Termux PATH fix
     os.environ["PATH"] += os.pathsep + os.path.expanduser("~/go/bin")
 
     send_discord_message("🛠️ Checking & installing required tools ...")
@@ -452,9 +420,9 @@ def main():
                 d=futures[fut]
                 try:
                     res=fut.result()
-                    send_discord_message(f"✅ Finished scan for {d}: {res.get('status')}")
+                    send_discord_message(f"✅ Finished: {d} -> {res.get('status')}")
                 except Exception as e:
-                    send_discord_message(f"⚠️ Error scanning {d}: {str(e)}")
+                    send_discord_message(f"❌ Error for {d}: {e}")
 
 if __name__=="__main__":
     main()
