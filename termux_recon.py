@@ -30,9 +30,10 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
+from collections import Counter
 
 # ----- CONFIG: EDIT THIS -----
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/PUT_YOUR_WEBHOOK"
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1388192484265427025/jnEKDqZ8u-4AFPmdfA7YTSXZSfP87I4ZUWZGrcCWkQn8LBgD3fKCec9BSJPrVKABDNy4"
 # -----------------------------
 
 # Tools mapping (go install pkg)
@@ -146,11 +147,10 @@ def send_discord_file(file_path, content=None, filename=None):
         filename = os.path.basename(file_path)
     try:
         with open(file_path, "rb") as f:
-            form = {"file": (filename, f)}
             data = {}
             if content:
                 data["payload_json"] = json.dumps({"content": content})
-            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data={}, timeout=60)
+            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data=data, timeout=60)
         return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
@@ -178,7 +178,6 @@ def filter_urls_set(urls):
     return sorted(out)
 
 def strip_scheme(urls):
-    """Strip http:// or https:// from URLs"""
     clean=[]
     for u in urls:
         if u.startswith("http://"):
@@ -210,9 +209,9 @@ def run_httpx_on_list(list_lines):
         stdout, stderr = proc.communicate(input="\n".join(fixed)+"\n", timeout=900)
         for ln in stdout.splitlines():
             ln = ln.strip()
-            if ln and "SUCCESS" in ln:
-                # Ambil URL saja tanpa label [SUCCESS]
-                alive.append(ln.split()[0])
+            if not ln: continue
+            # Ambil URL langsung
+            alive.append(ln)
         return 0, "\n".join(alive), stderr
     except Exception as e:
         return 1, "", str(e)
@@ -275,6 +274,31 @@ def send_partial_findings(lines):
     summary=f"⚠️ Partial Nuclei Findings ({len(lines)} new)\nExamples:\n"+"\n".join(lines[:5])
     send_discord_message(summary)
 
+# ----- nuclei summary -----
+def send_nuclei_summary(out_file, workdir, target):
+    lines = read_lines(out_file)
+    total_targets = len(lines)
+    severity_counts = Counter()
+    for l in lines:
+        # contoh: "TemplateID [C]" → ambil severity terakhir dalam []
+        if "[" in l and "]" in l:
+            sev = l.split("[")[-1].split("]")[0]
+            severity_counts[sev] += 1
+    summary = (
+        f"🏁 SCAN COMPLETED\n"
+        f"Workdir: {workdir}\n"
+        f"Target: {target}\n"
+        f"Targets scanned: {total_targets}\n"
+        f"Nuclei findings: {len(lines)}\n"
+        f"Severity\n"
+        f"🔴C:{severity_counts.get('critical',0)} "
+        f"🟠H:{severity_counts.get('high',0)} "
+        f"🟡M:{severity_counts.get('medium',0)} "
+        f"🔵L:{severity_counts.get('low',0)} "
+        f"ℹ️I:{severity_counts.get('info',0)}"
+    )
+    send_discord_message(summary)
+
 # ----- pipeline -----
 def pipeline_for_domain(domain, workdir:Path, args):
     workdir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +339,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     # katana
     combined=set(wayback)
     send_discord_message("🕷️ Katana crawling ...")
+    kat=[]
     if alive:
         tmp_hosts=workdir/f"kat_hosts_{ts}.txt"
         with open(tmp_hosts,"w") as f: f.write("\n".join(alive))
@@ -323,19 +348,18 @@ def pipeline_for_domain(domain, workdir:Path, args):
         combined.update(kat)
         send_discord_message(f"✅ katana: collected {len(kat)} URLs")
 
-    # menentukan input nuclei
+    # Tentukan input nuclei sesuai kondisi
     if combined:
-        nuclei_source=list(combined)
+        if kat:
+            nuclei_source = kat
+        else:
+            nuclei_source = wayback
     else:
-        nuclei_source=alive
+        nuclei_source = strip_scheme(alive)
 
     if not nuclei_source:
         send_discord_message(f"⚠️ No URLs to scan for {domain}.")
         return {"status":"no-targets"}
-
-    # jika ambil dari httpx, strip http/https
-    if not combined:
-        nuclei_source=strip_scheme(nuclei_source)
 
     tmp_list=workdir/f"nuclei_list_{ts}.txt"
     with open(tmp_list,"w") as f:
@@ -344,6 +368,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     send_discord_message(f"💥 Starting nuclei (severity={args.nuclei_severity})")
     run_nuclei_stream(str(tmp_list), str(out_nuc), severity=args.nuclei_severity, batch_size=5, batch_timeout=900, periodic_upload=True)
     send_discord_file(str(out_nuc), content=f"Nuclei results for {domain}")
+    send_nuclei_summary(str(out_nuc), workdir, domain)
 
     send_discord_message(f"🏁 Scan completed for {domain}")
     return {"status":"done"}
