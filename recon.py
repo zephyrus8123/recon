@@ -7,7 +7,7 @@ Recon pipeline with Discord real-time updates + partial nuclei streaming.
 Features:
 - Menu: [1] Single Target, [2] Multi Target (file list)
 - Auto-install missing tools (go install) & pip deps automatically
-- Pipeline: subfinder -> httpx-toolkit -> waybackurls -> katana -> combine -> filter -> nuclei
+- Pipeline: subfinder -> httpx -> waybackurls -> katana -> combine -> filter -> nuclei
 - Real-time Discord messages (per-step) and partial nuclei findings while nuclei runs
 - On nuclei finish: upload full nuclei output file (.txt) to Discord
 - Default nuclei severity: critical,high,medium (configurable via CLI)
@@ -38,7 +38,7 @@ DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1388192484265427025/j
 # Tools mapping (go install pkg)
 REQUIRED_TOOLS = {
     "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
-    "httpx-toolkit": "github.com/projectdiscovery/httpx-toolkit/cmd/httpx-toolkit@latest",
+    "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
     "waybackurls": "github.com/tomnomnom/waybackurls@latest",
     "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
     "nuclei": "github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest",
@@ -195,7 +195,7 @@ def run_subfinder(domain, out_path):
     return run(cmd, timeout=600)
 
 def run_httpx_on_list(list_lines):
-    cmd = ["httpx-toolkit", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-probe", "-timeout", "10", "-retries", "2"]
+    cmd = ["httpx", "-l", "-", "-o", "-", "-silent", "-no-color", "-follow-redirects", "-probe", "-timeout", "10", "-retries", "2"]
     alive=[]
     try:
         fixed = []
@@ -299,7 +299,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     out_filt=workdir/f"urls_filtered_{ts}.txt"
     out_nuc=workdir/f"nuclei_output_{ts}.txt"
 
-    send_discord_embed("🚀 RECON SCAN STARTED", f"Target: `{domain}`\nSteps: subfinder → httpx-toolkit → wayback → katana → filter → nuclei", color=0x00aaff)
+    send_discord_embed("🚀 RECON SCAN STARTED", f"Target: `{domain}`\nSteps: subfinder → httpx → wayback → katana → filter → nuclei", color=0x00aaff)
 
     # subfinder
     send_discord_message(f"⚪ Running subfinder for `{domain}` ...")
@@ -310,14 +310,14 @@ def pipeline_for_domain(domain, workdir:Path, args):
         send_discord_file(str(out_sub), content=f"📄 Subfinder Results ({len(subs)} items)")
 
     # httpx
-    send_discord_message("🌐 Checking which subdomains are alive with httpx-toolkit ...")
+    send_discord_message("🌐 Checking which subdomains are alive with httpx ...")
     alive=[]
     if subs:
         rc,stdout,stderr=run_httpx_on_list(subs)
         for ln in stdout.splitlines():
             if ln.strip():
                 alive.append(ln.strip())
-    send_discord_message(f"✅ httpx-toolkit: **{len(alive)}** alive hosts")
+    send_discord_message(f"✅ httpx: **{len(alive)}** alive hosts")
     if alive:
         tmp_alive_file=workdir/f"httpx_alive_{ts}.txt"
         with open(tmp_alive_file,"w") as f: f.write("\n".join(alive))
@@ -356,7 +356,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     send_discord_message(f"✅ Total combined URLs: **{len(combined)}**")
 
     # filter only responsive URLs for nuclei
-    send_discord_message(f"🔎 Probing URLs with httpx-toolkit to filter responsive URLs ...")
+    send_discord_message(f"🔎 Probing URLs with httpx to filter responsive URLs ...")
     responsive=[]
     if combined:
         rc,stdout,stderr=run_httpx_on_list(list(combined))
