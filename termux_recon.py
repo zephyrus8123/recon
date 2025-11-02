@@ -28,7 +28,7 @@ from collections import Counter
 import requests
 
 # ----- CONFIG -----
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/PUT_YOUR_WEBHOOK"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1434645581413879868/AXG3p-2f4t1fb-WqZ3ZAN9K2ctJllobCIHasSQyBPd5_G8fPkgyc8nV5C0vIp-cDJkP6"
 REQUIRED_TOOLS = {
     "subfinder":"github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
     "httpx":"github.com/projectdiscovery/httpx/cmd/httpx@latest",
