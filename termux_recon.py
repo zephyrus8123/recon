@@ -30,11 +30,9 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import requests
-import tempfile
-import signal
 
 # ----- CONFIG: EDIT THIS -----
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1388192484265427025/jnEKDqZ8u-4AFPmdfA7YTSXZSfP87I4ZUWZGrcCWkQn8LBgD3fKCec9BSJPrVKABDNy4"
+DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/PUT_YOUR_WEBHOOK"
 # -----------------------------
 
 # Tools mapping (go install pkg)
@@ -140,20 +138,6 @@ def send_discord_message(content, username="ZephyrusRecon"):
     except Exception as e:
         return False, str(e)
 
-def send_discord_embed(title, description=None, fields=None, color=0x2f3136):
-    if not DISCORD_WEBHOOK_URL or "PUT_YOUR" in DISCORD_WEBHOOK_URL:
-        print("[!] Discord webhook not configured. Skipping embed.")
-        return False, "no webhook"
-    embed = {"title": title, "description": description or "", "color": color}
-    if fields:
-        embed["fields"] = fields
-    payload = {"embeds": [embed]}
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
-        return (r.status_code in (200,204)), r.text
-    except Exception as e:
-        return False, str(e)
-
 def send_discord_file(file_path, content=None, filename=None):
     if not DISCORD_WEBHOOK_URL or "PUT_YOUR" in DISCORD_WEBHOOK_URL:
         print("[!] Discord webhook not configured. Skipping file upload.")
@@ -162,10 +146,11 @@ def send_discord_file(file_path, content=None, filename=None):
         filename = os.path.basename(file_path)
     try:
         with open(file_path, "rb") as f:
+            form = {"file": (filename, f)}
             data = {}
             if content:
                 data["payload_json"] = json.dumps({"content": content})
-            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data=data, timeout=60)
+            r = requests.post(DISCORD_WEBHOOK_URL, files={"file": (filename, f)}, data={}, timeout=60)
         return (r.status_code in (200,204)), r.text
     except Exception as e:
         return False, str(e)
@@ -192,15 +177,45 @@ def filter_urls_set(urls):
         out.add(u)
     return sorted(out)
 
+def strip_scheme(urls):
+    """Strip http:// or https:// from URLs"""
+    clean=[]
+    for u in urls:
+        if u.startswith("http://"):
+            clean.append(u[len("http://"):])
+        elif u.startswith("https://"):
+            clean.append(u[len("https://"):])
+        else:
+            clean.append(u)
+    return clean
+
 # ----- External tool wrappers -----
 def run_subfinder(domain, out_path):
     cmd = ["subfinder", "-d", domain, "-o", out_path]
     return run(cmd, timeout=600)
 
-def run_httpx_file(input_file, output_file):
-    # use file-mode input/output; do not include -probe (compatibility)
-    cmd = ["httpx", "-l", input_file, "-o", output_file, "-silent", "-no-color", "-follow-redirects", "-timeout", "10", "-retries", "2"]
-    return run(cmd, timeout=900)
+def run_httpx_on_list(list_lines):
+    cmd = ["httpx", "-silent", "-no-color", "-follow-redirects", "-probe", "-timeout", "10", "-retries", "2"]
+    alive=[]
+    fixed=[]
+    for u in list_lines:
+        u = u.strip()
+        if not u: continue
+        if not u.startswith("http://") and not u.startswith("https://"):
+            fixed.append("https://" + u)
+        else:
+            fixed.append(u)
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = proc.communicate(input="\n".join(fixed)+"\n", timeout=900)
+        for ln in stdout.splitlines():
+            ln = ln.strip()
+            if ln and "SUCCESS" in ln:
+                # Ambil URL saja tanpa label [SUCCESS]
+                alive.append(ln.split()[0])
+        return 0, "\n".join(alive), stderr
+    except Exception as e:
+        return 1, "", str(e)
 
 def run_wayback(domain, out_path):
     cmd = ["bash", "-lc", f"echo {domain} | waybackurls 2>/dev/null | tee {out_path}"]
@@ -210,81 +225,55 @@ def run_katana(hosts_file, out_file):
     cmd = ["katana", "-l", hosts_file, "-depth", "2", "-o", out_file]
     return run(cmd, timeout=1800)
 
-# ----- nuclei runner with periodic file uploads (no -json) -----
-def run_nuclei_and_periodic_upload(urls_file, out_file, severity="critical,high,medium", periodic_upload_interval=900):
-    """
-    Run nuclei writing plain text output to out_file (using -o),
-    and upload the current out_file to Discord every periodic_upload_interval seconds.
-    Returns a summary dict similar to previous implementation: {"findings": count_lines, "stderr": stderr}
-    """
-    cmd = ["nuclei", "-l", urls_file, "-o", out_file]
+# ----- nuclei streaming with periodic Discord upload -----
+def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", batch_size=5, batch_timeout=900, periodic_upload=True):
+    cmd = ["nuclei", "-l", urls_file]
     if severity:
         cmd += ["-severity", severity]
 
-    # ensure out_file directory exists
-    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    buffer_lines=[]
+    last_flush=time.time()
+    last_upload=time.time()
 
-    # Remove output file if exists
-    try:
-        if os.path.exists(out_file):
-            os.remove(out_file)
-    except Exception:
-        pass
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, preexec_fn=os.setsid if hasattr(os, "setsid") else None)
-
-    stop_uploader = threading.Event()
-
-    def uploader_loop():
-        # wait first interval then upload periodically while nuclei runs
-        while not stop_uploader.wait(periodic_upload_interval):
-            # upload partial file if exists
-            if os.path.exists(out_file):
+    with open(out_file,"w",encoding="utf-8") as fout:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+                if buffer_lines and (time.time()-last_flush)>=batch_timeout:
+                    send_partial_findings(buffer_lines)
+                    buffer_lines=[]
+                    last_flush=time.time()
+                if periodic_upload and (time.time()-last_upload)>=900:
+                    send_discord_file(out_file, content="Partial nuclei output")
+                    last_upload=time.time()
+                continue
+            line=line.strip()
+            if not line: continue
+            fout.write(line+"\n")
+            fout.flush()
+            buffer_lines.append(line)
+            if len(buffer_lines)>=batch_size or (time.time()-last_flush)>=batch_timeout:
+                send_partial_findings(buffer_lines)
+                buffer_lines=[]
+                last_flush=time.time()
+            if periodic_upload and (time.time()-last_upload)>=900:
                 send_discord_file(out_file, content="Partial nuclei output")
-    uploader_thread = threading.Thread(target=uploader_loop, daemon=True)
-    uploader_thread.start()
+                last_upload=time.time()
+        # flush remaining
+        if buffer_lines:
+            send_partial_findings(buffer_lines)
+        if periodic_upload:
+            send_discord_file(out_file, content="Final nuclei output")
+    return {"stdout": "nuclei finished"}
 
-    # We will read stdout line by line and also write to out_file (nuclei -o already writes, but some versions also print)
-    findings = 0
-    try:
-        # Wait for process to finish
-        stdout, stderr = proc.communicate()
-    except Exception as e:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
-            pass
-        stdout = ""
-        stderr = str(e)
-
-    # after finish, make sure to upload final file
-    stop_uploader.set()
-    try:
-        uploader_thread.join(timeout=2)
-    except Exception:
-        pass
-
-    # final upload
-    if os.path.exists(out_file):
-        send_discord_file(out_file, content="Final nuclei output")
-
-    # Count lines (findings) in out_file (best-effort)
-    findings = 0
-    try:
-        with open(out_file, "r", encoding="utf-8", errors="ignore") as f:
-            for _ in f:
-                findings += 1
-    except Exception:
-        findings = 0
-
-    return {"findings": findings, "stderr": stderr or ""}
-
-# ----- small helper for writing list to file -----
-def write_list_to_file(lines, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for l in lines:
-            f.write(l.strip() + "\n")
+def send_partial_findings(lines):
+    if not lines: return
+    summary=f"⚠️ Partial Nuclei Findings ({len(lines)} new)\nExamples:\n"+"\n".join(lines[:5])
+    send_discord_message(summary)
 
 # ----- pipeline -----
 def pipeline_for_domain(domain, workdir:Path, args):
@@ -293,111 +282,71 @@ def pipeline_for_domain(domain, workdir:Path, args):
     out_sub=workdir/f"subfinder_{ts}.txt"
     out_way=workdir/f"wayback_{ts}.txt"
     out_kat=workdir/f"katana_{ts}.txt"
-    out_alive=workdir/f"alive_httpx_{ts}.txt"
-    out_filt=workdir/f"urls_filtered_{ts}.txt"
     out_nuc=workdir/f"nuclei_output_{ts}.txt"
+    tmp_alive_file=workdir/f"alive_httpx_{ts}.txt"
 
-    send_discord_embed("🚀 RECON SCAN STARTED", f"Target: `{domain}`\nSteps: subfinder → httpx → wayback → katana → filter → nuclei", color=0x00aaff)
+    send_discord_message(f"🚀 RECON SCAN STARTED\nTarget: {domain}\nSteps: subfinder → httpx → wayback → katana → filter → nuclei")
 
     # subfinder
-    send_discord_message(f"⚪ Running subfinder for `{domain}` ...")
+    send_discord_message(f"⚪ Running subfinder for {domain} ...")
     run_subfinder(domain, str(out_sub))
     subs=read_lines(str(out_sub))
-    send_discord_message(f"✅ subfinder: found **{len(subs)}** subdomains")
+    send_discord_message(f"✅ subfinder: found {len(subs)} subdomains")
     if subs:
-        send_discord_file(str(out_sub), content=f"📄 Subfinder Results ({len(subs)} items)")
+        send_discord_file(str(out_sub), content=f"Subfinder Results ({len(subs)} items)")
 
-    # httpx (initial alive check)
+    # httpx
     send_discord_message("🌐 Checking which subdomains are alive with httpx ...")
     alive=[]
     if subs:
-        tmp_in = workdir/f"subdomains_input_{ts}.txt"
-        write_list_to_file(subs, str(tmp_in))
-        rc, out, err = run_httpx_file(str(tmp_in), str(out_alive))
-        # read alive list (httpx output file contains URLs only)
-        alive = read_lines(str(out_alive))
-    alive = sorted(set(alive))
-    send_discord_message(f"✅ httpx: **{len(alive)}** alive hosts")
+        rc, stdout, stderr = run_httpx_on_list(subs)
+        alive = stdout.splitlines()
+    send_discord_message(f"✅ httpx: {len(alive)} alive hosts")
     if alive:
-        send_discord_file(str(out_alive), content=f"📄 HTTPX Toolkit Alive Hosts ({len(alive)} items)")
+        with open(tmp_alive_file,"w") as f: f.write("\n".join(alive))
+        send_discord_file(str(tmp_alive_file), content=f"HTTPX Alive Hosts ({len(alive)} items)")
 
     # wayback
     send_discord_message("📚 Collecting Wayback URLs ...")
     run_wayback(domain, str(out_way))
-    wayback = read_lines(str(out_way))
-    send_discord_message(f"✅ waybackurls: **{len(wayback)}** URLs collected")
-    if wayback:
-        send_discord_file(str(out_way), content=f"📄 Wayback URLs ({len(wayback)} items)")
-    else:
-        send_discord_message("⚠️ Wayback URLs kosong.")
+    wayback=read_lines(str(out_way))
+    send_discord_message(f"✅ waybackurls: {len(wayback)} URLs collected")
 
     # katana
-    combined_from_katana = []
-    if args.use_katana_single or args.mode=="multi":
-        send_discord_message("🕷️ Katana crawling ...")
-        hosts = alive if alive else [domain]
-        tmp_hosts = workdir/f"kat_hosts_{ts}.txt"
-        write_list_to_file(hosts, str(tmp_hosts))
-        run_katana(str(tmp_hosts), str(out_kat))
-        kat = read_lines(str(out_kat))
-        combined_from_katana = kat
-        send_discord_message(f"✅ katana: collected **{len(kat)}** URLs")
-        if kat:
-            send_discord_file(str(out_kat), content=f"📄 Katana URLs ({len(kat)} items)")
-        else:
-            send_discord_message("⚠️ Katana URLs kosong.")
-    else:
-        kat = []
+    combined=set(wayback)
+    send_discord_message("🕷️ Katana crawling ...")
+    if alive:
+        tmp_hosts=workdir/f"kat_hosts_{ts}.txt"
+        with open(tmp_hosts,"w") as f: f.write("\n".join(alive))
+        run_katana(str(tmp_hosts),str(out_kat))
+        kat=read_lines(str(out_kat))
+        combined.update(kat)
+        send_discord_message(f"✅ katana: collected {len(kat)} URLs")
 
-    # Decide source for nuclei:
-    # priority: katana (if any) -> wayback (if any) -> alive (httpx)
-    if kat:
-        nuclei_source = kat
-        source_name = "katana"
-    elif wayback:
-        nuclei_source = wayback
-        source_name = "wayback"
+    # menentukan input nuclei
+    if combined:
+        nuclei_source=list(combined)
     else:
-        nuclei_source = alive
-        source_name = "httpx"
-
-    send_discord_message(f"✅ Total combined URLs: **{len(nuclei_source)}** (using {source_name} for nuclei)")
+        nuclei_source=alive
 
     if not nuclei_source:
-        send_discord_message(f"⚠️ No URLs to scan for `{domain}`.")
+        send_discord_message(f"⚠️ No URLs to scan for {domain}.")
         return {"status":"no-targets"}
 
-    # If source is httpx (alive) we DO NOT re-filter with httpx.
-    # If source is wayback or katana we also skip re-filtering unless you want extra probe.
-    # So we skip extra httpx filtering step entirely per your request.
+    # jika ambil dari httpx, strip http/https
+    if not combined:
+        nuclei_source=strip_scheme(nuclei_source)
 
-    pool = filter_urls_set(nuclei_source)
-    with open(out_filt,"w", encoding="utf-8") as f:
-        for u in pool:
-            f.write(u + "\n")
-    send_discord_message(f"🔘 Filtered targets for nuclei: **{len(pool)}**")
-    send_discord_file(str(out_filt), content="Filtered URLs")
+    tmp_list=workdir/f"nuclei_list_{ts}.txt"
+    with open(tmp_list,"w") as f:
+        for u in nuclei_source: f.write(u+"\n")
 
-    # nuclei: run and periodically upload partial output every 15 minutes (900s)
     send_discord_message(f"💥 Starting nuclei (severity={args.nuclei_severity})")
-    tmp_list = workdir/f"nuclei_list_{ts}.txt"
-    write_list_to_file(pool, str(tmp_list))
+    run_nuclei_stream(str(tmp_list), str(out_nuc), severity=args.nuclei_severity, batch_size=5, batch_timeout=900, periodic_upload=True)
+    send_discord_file(str(out_nuc), content=f"Nuclei results for {domain}")
 
-    summary = run_nuclei_and_periodic_upload(str(tmp_list), str(out_nuc), severity=args.nuclei_severity, periodic_upload_interval=900)
-
-    fields=[{"name":"Target","value":domain,"inline":True},
-            {"name":"Targets scanned","value":str(len(pool)),"inline":True},
-            {"name":"Nuclei findings","value":str(summary["findings"]),"inline":True}]
-    sev=f"🔴C:unknown 🟠H:unknown 🟡M:unknown 🔵L:unknown ℹ️:unknown"
-    fields.append({"name":"Severity","value":sev,"inline":False})
-    send_discord_embed("🏁 SCAN COMPLETED", description=f"Workdir: `{workdir}`", fields=fields, color=0x00ff88)
-
-    send_discord_message("📎 Uploading nuclei output ...")
-    ok,info=send_discord_file(str(out_nuc),content=f"Nuclei results for {domain}")
-    if ok: send_discord_message("✅ Uploaded nuclei output file.")
-    else: send_discord_message(f"⚠️ Upload failed: {info}")
-
-    return {"status":"done","summary":summary}
+    send_discord_message(f"🏁 Scan completed for {domain}")
+    return {"status":"done"}
 
 # ----- main -----
 def main():
@@ -407,7 +356,6 @@ def main():
     parser.add_argument("--nuclei-severity",default="critical,high,medium")
     args=parser.parse_args()
 
-    # --- Termux PATH fix (include go bin)
     os.environ["PATH"] += os.pathsep + os.path.expanduser("~/go/bin")
 
     send_discord_message("🛠️ Checking & installing required tools ...")
@@ -416,26 +364,21 @@ def main():
 
     print("Choose mode:\n[1] Single Target\n[2] Multi Target (file)")
     choice=input("Select 1 or 2: ").strip()
-    if choice not in("1","2"):
-        print("Invalid choice"); return
-    mode="single" if choice=="1" else "multi"
+    if choice not in("1","2"): return
 
-    if mode=="single":
+    if choice=="1":
         domain=input("Enter target domain (example.com): ").strip()
-        send_discord_message(f"🛰️ Single-target scan initiated for `{domain}`")
+        send_discord_message(f"🛰️ Single-target scan initiated for {domain}")
         class Arg: pass
         Arg.mode="single"
         Arg.use_katana_single=True
         Arg.nuclei_severity=args.nuclei_severity
         workdir=Path(args.workdir)/domain.replace(".","_")
-        workdir.mkdir(parents=True,exist_ok=True)
         pipeline_for_domain(domain,workdir,Arg)
-
     else:
         list_path=input("Enter path to domains file: ").strip()
         domains=read_lines(list_path)
-        if not domains:
-            print("No domains found."); return
+        if not domains: return
         send_discord_message(f"🛰️ Multi-target recon started ({len(domains)} domains)")
         with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             futures={}
@@ -450,7 +393,7 @@ def main():
                     res=fut.result()
                     send_discord_message(f"✅ Finished scan for {d}: {res.get('status')}")
                 except Exception as e:
-                    send_discord_message(f"⚠️ Error scanning {d}: {str(e)}")
+                    send_discord_message(f"⚠️ Error scanning {d}: {e}")
 
     send_discord_message("🏁 All tasks finished. Check uploaded files.")
 
