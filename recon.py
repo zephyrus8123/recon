@@ -129,21 +129,23 @@ def run_subfinder(domain, out_path): return run(["subfinder","-d",domain,"-o",ou
 def run_wayback(domain, out_path): return run(["bash","-lc",f"echo {domain}|waybackurls 2>/dev/null|tee {out_path}"], timeout=300, shell=True)
 def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)  # ✅ FIXED '-list'
 
-# ----- HTTPX wrapper (fixed -list) -----
+# ----- HTTPX wrapper (fixed to use -list instead of -l) -----
 def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes=None):
     """
     Run httpx (or httpx-toolkit) on a temporary input file and return only alive URLs.
     Returns: (rc, stdout_text, stderr_text) where stdout_text is newline-separated alive URLs.
     """
-    # pick binary: httpx-toolkit if present, otherwise httpx
-    bin_name = "httpx-toolkit" if which("httpx-toolkit") else "httpx"
+    # pakai httpx saja, bukan httpx-toolkit
+    bin_name = "httpx"
     if not which(bin_name):
         return 1, "", f"{bin_name} not found in PATH"
 
+    # tulis input list ke file sementara
     tmp_in = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_out = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_in_path = tmp_in.name
     tmp_out_path = tmp_out.name
+
     try:
         for u in list_lines:
             if u:
@@ -152,7 +154,7 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         tmp_in.close()
         tmp_out.close()
 
-        # ✅ FIXED: changed '-l' to '-list'
+        # ganti -l → -list
         cmd = [
             bin_name,
             "-list", tmp_in_path,
@@ -161,18 +163,23 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
             "-threads", str(threads),
             "-o", tmp_out_path
         ]
+
         if status_codes:
             cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
         rc, out, err = run(cmd, capture=True, timeout=900)
+
         alive = []
         if os.path.exists(tmp_out_path):
             alive = read_lines(tmp_out_path)
         else:
             alive = [l.strip() for l in out.splitlines() if l.strip()]
 
-        os.remove(tmp_in_path)
-        os.remove(tmp_out_path)
+        try: os.remove(tmp_in_path)
+        except: pass
+        try: os.remove(tmp_out_path)
+        except: pass
+
         return rc, "\n".join(alive), err or ""
     except Exception as e:
         try: os.remove(tmp_in_path)
@@ -180,7 +187,7 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         try: os.remove(tmp_out_path)
         except: pass
         return 1, "", str(e)
-
+        
 # ----- Nuclei streaming (10 min heartbeat, ANSI cleaned) -----
 def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", periodic_upload=True, interval_seconds=600):
     ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
