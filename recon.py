@@ -127,14 +127,10 @@ def strip_scheme(urls):
 # ----- Tool wrappers -----
 def run_subfinder(domain, out_path): return run(["subfinder","-d",domain,"-o",out_path], timeout=600)
 def run_wayback(domain, out_path): return run(["bash","-lc",f"echo {domain}|waybackurls 2>/dev/null|tee {out_path}"], timeout=300, shell=True)
-def run_katana(hosts_file, out_file): return run(["katana","-l",hosts_file,"-depth","2","-o",out_file], timeout=1800)
+def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)
 
-# ----- HTTPX wrapper (fixed & adaptive) -----
+# ----- HTTPX wrapper (fixed - use -list) -----
 def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes=None):
-    """
-    Run httpx on a temporary input file and return only alive URLs.
-    Automatically detects whether to use -l or -list depending on httpx version.
-    """
     bin_name = "httpx"
     if not which(bin_name):
         return 1, "", f"{bin_name} not found in PATH"
@@ -151,21 +147,15 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         tmp_in.close()
         tmp_out.close()
 
-        # --- auto detect flag ---
-        flag = "-l"
-        rc_test, _, err_test = run([bin_name, "-l"], capture=True)
-        if "No such option" in err_test or "unknown flag" in err_test:
-            flag = "-list"
-
-    cmd = [
-        bin_name,
-        "-list", tmp_in_path,   # ✅ fix: gunakan -list
-        "-silent",
-        "-timeout", str(timeout_s),
-        "-threads", str(threads),
-        "-o", tmp_out_path
-         ]
-
+        # ✅ FIXED: gunakan -list, bukan -l
+        cmd = [
+            bin_name,
+            "-list", tmp_in_path,
+            "-silent",
+            "-timeout", str(timeout_s),
+            "-threads", str(threads),
+            "-o", tmp_out_path
+        ]
         if status_codes:
             cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
@@ -178,15 +168,14 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
 
         os.remove(tmp_in_path)
         os.remove(tmp_out_path)
+
         return rc, "\n".join(alive), err or ""
     except Exception as e:
-        try: os.remove(tmp_in_path)
-        except: pass
-        try: os.remove(tmp_out_path)
-        except: pass
+        os.remove(tmp_in_path)
+        os.remove(tmp_out_path)
         return 1, "", str(e)
 
-# ----- Nuclei stream -----
+# ----- Nuclei streaming (10 min heartbeat) -----
 def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", periodic_upload=True, interval_seconds=600):
     ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
     cmd = ["nuclei", "-l", urls_file, "-severity", severity]
@@ -203,18 +192,12 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", peri
             fout.flush()
             buffer_lines.append(clean_line)
             if periodic_upload and (time.time() - last_upload) >= interval_seconds:
-                try:
-                    send_discord_file(out_file, f"Partial nuclei output ({len(buffer_lines)} new findings)")
-                except Exception:
-                    pass
+                send_discord_file(out_file, f"Partial nuclei output ({len(buffer_lines)} new findings)")
                 last_upload = time.time()
                 buffer_lines.clear()
         proc.wait()
     if periodic_upload:
-        try:
-            send_discord_file(out_file, "Final nuclei output (scan completed)")
-        except Exception:
-            pass
+        send_discord_file(out_file, "Final nuclei output (scan completed)")
     return {"stdout": "nuclei finished"}
 
 def send_nuclei_summary(out_file, workdir, target):
