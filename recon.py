@@ -157,14 +157,15 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         if "No such option" in err_test or "unknown flag" in err_test:
             flag = "-list"
 
-        cmd = [
-            bin_name,
-            flag, tmp_in_path,
-            "-silent",
-            "-timeout", str(timeout_s),
-            "-threads", str(threads),
-            "-o", tmp_out_path
-        ]
+    cmd = [
+        bin_name,
+        "-list", tmp_in_path,   # ✅ fix: gunakan -list
+        "-silent",
+        "-timeout", str(timeout_s),
+        "-threads", str(threads),
+        "-o", tmp_out_path
+         ]
+
         if status_codes:
             cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
