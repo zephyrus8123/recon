@@ -16,7 +16,7 @@ from collections import Counter
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1434645581413879868/AXG3p-2f4t1fb-WqZ3ZAN9K2ctJllobCIHasSQyBPd5_G8fPkgyc8nV5C0vIp-cDJkP6"
 REQUIRED_TOOLS = {
     "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
-    "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
+    "httpx-toolkit": "github.com/projectdiscovery/httpx/cmd/httpx@latest",  # keep go link as projectdiscovery httpx
     "waybackurls": "github.com/tomnomnom/waybackurls@latest",
     "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
     "nuclei": "github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest",
@@ -127,11 +127,16 @@ def strip_scheme(urls):
 # ----- Tool wrappers -----
 def run_subfinder(domain, out_path): return run(["subfinder","-d",domain,"-o",out_path], timeout=600)
 def run_wayback(domain, out_path): return run(["bash","-lc",f"echo {domain}|waybackurls 2>/dev/null|tee {out_path}"], timeout=300, shell=True)
-def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)
+def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)  # ✅ FIXED '-list'
 
-# ----- HTTPX wrapper (fixed with -list) -----
+# ----- HTTPX wrapper (fixed -list) -----
 def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes=None):
-    bin_name = "httpx"
+    """
+    Run httpx (or httpx-toolkit) on a temporary input file and return only alive URLs.
+    Returns: (rc, stdout_text, stderr_text) where stdout_text is newline-separated alive URLs.
+    """
+    # pick binary: httpx-toolkit if present, otherwise httpx
+    bin_name = "httpx-toolkit" if which("httpx-toolkit") else "httpx"
     if not which(bin_name):
         return 1, "", f"{bin_name} not found in PATH"
 
@@ -147,9 +152,10 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         tmp_in.close()
         tmp_out.close()
 
+        # ✅ FIXED: changed '-l' to '-list'
         cmd = [
             bin_name,
-            "-list", tmp_in_path,  # fixed flag here
+            "-list", tmp_in_path,
             "-silent",
             "-timeout", str(timeout_s),
             "-threads", str(threads),
@@ -159,18 +165,14 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
             cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
         rc, out, err = run(cmd, capture=True, timeout=900)
-
         alive = []
         if os.path.exists(tmp_out_path):
             alive = read_lines(tmp_out_path)
         else:
             alive = [l.strip() for l in out.splitlines() if l.strip()]
 
-        try: os.remove(tmp_in_path)
-        except: pass
-        try: os.remove(tmp_out_path)
-        except: pass
-
+        os.remove(tmp_in_path)
+        os.remove(tmp_out_path)
         return rc, "\n".join(alive), err or ""
     except Exception as e:
         try: os.remove(tmp_in_path)
@@ -179,7 +181,7 @@ def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes
         except: pass
         return 1, "", str(e)
 
-# ----- Nuclei streaming (10 min heartbeat) -----
+# ----- Nuclei streaming (10 min heartbeat, ANSI cleaned) -----
 def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", periodic_upload=True, interval_seconds=600):
     ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
     cmd = ["nuclei", "-l", urls_file, "-severity", severity]
@@ -203,6 +205,7 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", peri
                 last_upload = time.time()
                 buffer_lines.clear()
         proc.wait()
+
     if periodic_upload:
         try:
             send_discord_file(out_file, "Final nuclei output (scan completed)")
@@ -247,7 +250,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     cprint(f"Subfinder found {len(subs)} subdomains", Fore.GREEN)
     send_discord_file(str(out_sub), f"Subfinder Results ({len(subs)})")
 
-    send_discord_embed("🌐 HTTPX", "Checking alive hosts...")
+    send_discord_embed("🌐 HTTPX-toolkit", "Checking alive hosts...")
     rc, stdout, stderr = run_httpx_toolkit_on_list(subs, threads=50, timeout_s=10)
     if rc != 0 and not stdout:
         send_discord_embed("⚠️ HTTPX failed", f"httpx returned rc={rc}. Error: {stderr or 'no output'}. Falling back to unfiltered list.")
@@ -257,8 +260,8 @@ def pipeline_for_domain(domain, workdir:Path, args):
     tmp_alive_file = workdir / f"alive_httpx_{ts}.txt"
     with open(tmp_alive_file, "w", encoding="utf-8") as f:
         f.write("\n".join(alive))
-    cprint(f"HTTPX found {len(alive)} alive hosts", Fore.GREEN)
-    send_discord_file(str(tmp_alive_file), f"HTTPX Alive Hosts ({len(alive)})")
+    cprint(f"HTTPX-toolkit found {len(alive)} alive hosts", Fore.GREEN)
+    send_discord_file(str(tmp_alive_file), f"HTTPX-toolkit Alive Hosts ({len(alive)})")
 
     send_discord_embed("📚 Wayback", "Collecting Wayback URLs ...")
     run_wayback(domain, str(out_way))
