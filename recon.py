@@ -16,7 +16,7 @@ from collections import Counter
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1434645581413879868/AXG3p-2f4t1fb-WqZ3ZAN9K2ctJllobCIHasSQyBPd5_G8fPkgyc8nV5C0vIp-cDJkP6"
 REQUIRED_TOOLS = {
     "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
-    "httpx-toolkit": "github.com/projectdiscovery/httpx/cmd/httpx@latest",  # keep go link as projectdiscovery httpx
+    "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
     "waybackurls": "github.com/tomnomnom/waybackurls@latest",
     "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
     "nuclei": "github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest",
@@ -127,68 +127,65 @@ def strip_scheme(urls):
 # ----- Tool wrappers -----
 def run_subfinder(domain, out_path): return run(["subfinder","-d",domain,"-o",out_path], timeout=600)
 def run_wayback(domain, out_path): return run(["bash","-lc",f"echo {domain}|waybackurls 2>/dev/null|tee {out_path}"], timeout=300, shell=True)
-def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)  # ✅ FIXED '-list'
+def run_katana(hosts_file, out_file): return run(["katana","-l",hosts_file,"-depth","2","-o",out_file], timeout=1800)
 
+# ----- HTTPX wrapper (fixed & adaptive) -----
 def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes=None):
     """
     Run httpx on a temporary input file and return only alive URLs.
-    Automatically detects whether to use -list or -l based on version.
+    Automatically detects whether to use -l or -list depending on httpx version.
     """
     bin_name = "httpx"
     if not which(bin_name):
         return 1, "", f"{bin_name} not found in PATH"
 
-    # tulis input ke file temp
     tmp_in = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_out = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_in_path = tmp_in.name
     tmp_out_path = tmp_out.name
-    for u in list_lines:
-        if u:
-            tmp_in.write(u.strip() + "\n")
-    tmp_in.flush()
-    tmp_in.close()
-    tmp_out.close()
+    try:
+        for u in list_lines:
+            if u:
+                tmp_in.write(u.strip() + "\n")
+        tmp_in.flush()
+        tmp_in.close()
+        tmp_out.close()
 
-    # cek versi httpx untuk tahu flag yg benar
-    rc_ver, ver_out, _ = run([bin_name, "-version"], capture=True)
-    use_long_flag = "-list"
-    if "httpx" in ver_out and ("1.2" in ver_out or "1.1" in ver_out or "1.0" in ver_out):
-        use_long_flag = "-l"
+        # --- auto detect flag ---
+        flag = "-l"
+        rc_test, _, err_test = run([bin_name, "-l"], capture=True)
+        if "No such option" in err_test or "unknown flag" in err_test:
+            flag = "-list"
 
-    cmd = [
-        bin_name,
-        use_long_flag, tmp_in_path,
-        "-silent",
-        "-timeout", str(timeout_s),
-        "-threads", str(threads),
-        "-o", tmp_out_path,
-    ]
-    if status_codes:
-        cmd.extend(["-mc", ",".join(map(str, status_codes))])
+        cmd = [
+            bin_name,
+            flag, tmp_in_path,
+            "-silent",
+            "-timeout", str(timeout_s),
+            "-threads", str(threads),
+            "-o", tmp_out_path
+        ]
+        if status_codes:
+            cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
-    rc, out, err = run(cmd, capture=True, timeout=900)
-    alive = []
-    if os.path.exists(tmp_out_path):
-        alive = read_lines(tmp_out_path)
-    else:
-        alive = [l.strip() for l in out.splitlines() if l.strip()]
+        rc, out, err = run(cmd, capture=True, timeout=900)
+        alive = []
+        if os.path.exists(tmp_out_path):
+            alive = read_lines(tmp_out_path)
+        else:
+            alive = [l.strip() for l in out.splitlines() if l.strip()]
 
-    # cleanup
-    try: os.remove(tmp_in_path)
-    except: pass
-    try: os.remove(tmp_out_path)
-    except: pass
-
-    return rc, "\n".join(alive), err or ""
+        os.remove(tmp_in_path)
+        os.remove(tmp_out_path)
+        return rc, "\n".join(alive), err or ""
     except Exception as e:
         try: os.remove(tmp_in_path)
         except: pass
         try: os.remove(tmp_out_path)
         except: pass
         return 1, "", str(e)
-        
-# ----- Nuclei streaming (10 min heartbeat, ANSI cleaned) -----
+
+# ----- Nuclei stream -----
 def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", periodic_upload=True, interval_seconds=600):
     ansi_escape = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
     cmd = ["nuclei", "-l", urls_file, "-severity", severity]
@@ -212,7 +209,6 @@ def run_nuclei_stream(urls_file, out_file, severity="critical,high,medium", peri
                 last_upload = time.time()
                 buffer_lines.clear()
         proc.wait()
-
     if periodic_upload:
         try:
             send_discord_file(out_file, "Final nuclei output (scan completed)")
@@ -257,7 +253,7 @@ def pipeline_for_domain(domain, workdir:Path, args):
     cprint(f"Subfinder found {len(subs)} subdomains", Fore.GREEN)
     send_discord_file(str(out_sub), f"Subfinder Results ({len(subs)})")
 
-    send_discord_embed("🌐 HTTPX-toolkit", "Checking alive hosts...")
+    send_discord_embed("🌐 HTTPX", "Checking alive hosts...")
     rc, stdout, stderr = run_httpx_toolkit_on_list(subs, threads=50, timeout_s=10)
     if rc != 0 and not stdout:
         send_discord_embed("⚠️ HTTPX failed", f"httpx returned rc={rc}. Error: {stderr or 'no output'}. Falling back to unfiltered list.")
@@ -267,8 +263,8 @@ def pipeline_for_domain(domain, workdir:Path, args):
     tmp_alive_file = workdir / f"alive_httpx_{ts}.txt"
     with open(tmp_alive_file, "w", encoding="utf-8") as f:
         f.write("\n".join(alive))
-    cprint(f"HTTPX-toolkit found {len(alive)} alive hosts", Fore.GREEN)
-    send_discord_file(str(tmp_alive_file), f"HTTPX-toolkit Alive Hosts ({len(alive)})")
+    cprint(f"HTTPX found {len(alive)} alive hosts", Fore.GREEN)
+    send_discord_file(str(tmp_alive_file), f"HTTPX Alive Hosts ({len(alive)})")
 
     send_discord_embed("📚 Wayback", "Collecting Wayback URLs ...")
     run_wayback(domain, str(out_way))
