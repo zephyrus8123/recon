@@ -129,58 +129,58 @@ def run_subfinder(domain, out_path): return run(["subfinder","-d",domain,"-o",ou
 def run_wayback(domain, out_path): return run(["bash","-lc",f"echo {domain}|waybackurls 2>/dev/null|tee {out_path}"], timeout=300, shell=True)
 def run_katana(hosts_file, out_file): return run(["katana","-list",hosts_file,"-depth","2","-o",out_file], timeout=1800)  # ✅ FIXED '-list'
 
-# ----- HTTPX wrapper (fixed to use -list instead of -l) -----
 def run_httpx_toolkit_on_list(list_lines, threads=50, timeout_s=10, status_codes=None):
     """
-    Run httpx (or httpx-toolkit) on a temporary input file and return only alive URLs.
-    Returns: (rc, stdout_text, stderr_text) where stdout_text is newline-separated alive URLs.
+    Run httpx on a temporary input file and return only alive URLs.
+    Automatically detects whether to use -list or -l based on version.
     """
-    # pakai httpx saja, bukan httpx-toolkit
     bin_name = "httpx"
     if not which(bin_name):
         return 1, "", f"{bin_name} not found in PATH"
 
-    # tulis input list ke file sementara
+    # tulis input ke file temp
     tmp_in = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_out = tempfile.NamedTemporaryFile(mode="w", delete=False, encoding="utf-8")
     tmp_in_path = tmp_in.name
     tmp_out_path = tmp_out.name
+    for u in list_lines:
+        if u:
+            tmp_in.write(u.strip() + "\n")
+    tmp_in.flush()
+    tmp_in.close()
+    tmp_out.close()
 
-    try:
-        for u in list_lines:
-            if u:
-                tmp_in.write(u.strip() + "\n")
-        tmp_in.flush()
-        tmp_in.close()
-        tmp_out.close()
+    # cek versi httpx untuk tahu flag yg benar
+    rc_ver, ver_out, _ = run([bin_name, "-version"], capture=True)
+    use_long_flag = "-list"
+    if "httpx" in ver_out and ("1.2" in ver_out or "1.1" in ver_out or "1.0" in ver_out):
+        use_long_flag = "-l"
 
-        # ganti -l → -list
-        cmd = [
-            bin_name,
-            "-list", tmp_in_path,
-            "-silent",
-            "-timeout", str(timeout_s),
-            "-threads", str(threads),
-            "-o", tmp_out_path
-        ]
+    cmd = [
+        bin_name,
+        use_long_flag, tmp_in_path,
+        "-silent",
+        "-timeout", str(timeout_s),
+        "-threads", str(threads),
+        "-o", tmp_out_path,
+    ]
+    if status_codes:
+        cmd.extend(["-mc", ",".join(map(str, status_codes))])
 
-        if status_codes:
-            cmd.extend(["-mc", ",".join(map(str, status_codes))])
+    rc, out, err = run(cmd, capture=True, timeout=900)
+    alive = []
+    if os.path.exists(tmp_out_path):
+        alive = read_lines(tmp_out_path)
+    else:
+        alive = [l.strip() for l in out.splitlines() if l.strip()]
 
-        rc, out, err = run(cmd, capture=True, timeout=900)
+    # cleanup
+    try: os.remove(tmp_in_path)
+    except: pass
+    try: os.remove(tmp_out_path)
+    except: pass
 
-        alive = []
-        if os.path.exists(tmp_out_path):
-            alive = read_lines(tmp_out_path)
-        else:
-            alive = [l.strip() for l in out.splitlines() if l.strip()]
-
-        try: os.remove(tmp_in_path)
-        except: pass
-        try: os.remove(tmp_out_path)
-        except: pass
-
-        return rc, "\n".join(alive), err or ""
+    return rc, "\n".join(alive), err or ""
     except Exception as e:
         try: os.remove(tmp_in_path)
         except: pass
